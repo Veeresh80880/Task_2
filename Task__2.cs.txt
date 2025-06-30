@@ -1,0 +1,371 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Threading.Tasks;
+using System.Linq;
+
+// Simple standalone C# program - no external dependencies
+namespace EmployeeTimeTracker
+{
+    // Simple JSON parser (no external libraries needed)
+    public class SimpleJsonParser
+    {
+        public static List<TimeEntry> ParseTimeEntries(string json)
+        {
+            var entries = new List<TimeEntry>();
+            
+            // Remove brackets and split by objects
+            json = json.Trim('[', ']');
+            var objects = SplitJsonObjects(json);
+            
+            foreach (var obj in objects)
+            {
+                var entry = ParseSingleEntry(obj);
+                if (entry != null) entries.Add(entry);
+            }
+            
+            return entries;
+        }
+        
+        private static List<string> SplitJsonObjects(string json)
+        {
+            var objects = new List<string>();
+            int braceCount = 0;
+            int start = 0;
+            
+            for (int i = 0; i < json.Length; i++)
+            {
+                if (json[i] == '{') braceCount++;
+                else if (json[i] == '}') 
+                {
+                    braceCount--;
+                    if (braceCount == 0)
+                    {
+                        objects.Add(json.Substring(start, i - start + 1));
+                        start = i + 1;
+                        while (start < json.Length && (json[start] == ',' || json[start] == ' ')) start++;
+                        i = start - 1;
+                    }
+                }
+            }
+            
+            return objects;
+        }
+        
+        private static TimeEntry ParseSingleEntry(string json)
+        {
+            try
+            {
+                var entry = new TimeEntry();
+                
+                entry.Id = ExtractValue(json, "Id");
+                entry.EmployeeName = ExtractValue(json, "EmployeeName");
+                entry.EntryNotes = ExtractValue(json, "EntryNotes");
+                
+                var startTime = ExtractValue(json, "StarTimeUtc");
+                var endTime = ExtractValue(json, "EndTimeUtc");
+                var deletedOn = ExtractValue(json, "DeletedOn");
+                
+                if (DateTime.TryParse(startTime, out DateTime start))
+                    entry.StarTimeUtc = start;
+                
+                if (DateTime.TryParse(endTime, out DateTime end))
+                    entry.EndTimeUtc = end;
+                
+                if (!string.IsNullOrEmpty(deletedOn) && deletedOn != "null" && DateTime.TryParse(deletedOn, out DateTime deleted))
+                    entry.DeletedOn = deleted;
+                
+                return entry;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+        
+        private static string ExtractValue(string json, string key)
+        {
+            var pattern = $"\"{key}\":";
+            int start = json.IndexOf(pattern);
+            if (start == -1) return "";
+            
+            start += pattern.Length;
+            while (start < json.Length && (json[start] == ' ' || json[start] == '\t')) start++;
+            
+            if (start >= json.Length) return "";
+            
+            if (json[start] == '"')
+            {
+                start++;
+                int end = start;
+                while (end < json.Length && json[end] != '"') end++;
+                return end < json.Length ? json.Substring(start, end - start) : "";
+            }
+            else if (json[start] == 'n' && json.Substring(start, 4) == "null")
+            {
+                return "null";
+            }
+            else
+            {
+                int end = start;
+                while (end < json.Length && json[end] != ',' && json[end] != '}') end++;
+                return json.Substring(start, end - start).Trim();
+            }
+        }
+    }
+
+    public class TimeEntry
+    {
+        public string Id { get; set; } = "";
+        public string EmployeeName { get; set; } = "";
+        public DateTime StarTimeUtc { get; set; }
+        public DateTime EndTimeUtc { get; set; }
+        public string EntryNotes { get; set; } = "";
+        public DateTime? DeletedOn { get; set; }
+    }
+
+    public class EmployeeSummary
+    {
+        public string Name { get; set; } = "";
+        public double TotalHours { get; set; }
+        public double Percentage { get; set; }
+    }
+
+    class Program
+    {
+        private const string API_URL = "https://rc-vault-fap-live-1.azurewebsites.net/api/gettimeentries?code=vO17RnE8vuzXzPJo5eaLLjXjmRW07law99QTD90zat9FfOQJKKUcgQ==";
+
+        static async Task Main(string[] args)
+        {
+            Console.WriteLine("===========================================");
+            Console.WriteLine("  Employee Time Tracker - Simple Version");
+            Console.WriteLine("===========================================");
+            Console.WriteLine();
+
+            try
+            {
+                Console.WriteLine("📡 Fetching data from API...");
+                
+                // Fetch data from API
+                using var client = new HttpClient();
+                client.Timeout = TimeSpan.FromSeconds(30);
+                string jsonData = await client.GetStringAsync(API_URL);
+                
+                Console.WriteLine($"✓ Data received: {jsonData.Length} characters");
+                
+                // Parse JSON manually (no external libraries)
+                Console.WriteLine("⚙️  Processing time entries...");
+                var timeEntries = SimpleJsonParser.ParseTimeEntries(jsonData);
+                
+                Console.WriteLine($"✓ Parsed {timeEntries.Count} total entries");
+
+                // Filter valid entries
+                var validEntries = timeEntries
+                    .Where(e => e.DeletedOn == null && !string.IsNullOrEmpty(e.EmployeeName))
+                    .ToList();
+                
+                Console.WriteLine($"✓ Valid entries: {validEntries.Count}");
+
+                // Calculate hours per employee
+                var employeeSummaries = validEntries
+                    .GroupBy(e => e.EmployeeName)
+                    .Select(g => new EmployeeSummary
+                    {
+                        Name = g.Key,
+                        TotalHours = g.Sum(e => CalculateHours(e.StarTimeUtc, e.EndTimeUtc))
+                    })
+                    .Where(e => e.TotalHours > 0)
+                    .OrderByDescending(e => e.TotalHours)
+                    .ToList();
+
+                Console.WriteLine($"✓ Employees processed: {employeeSummaries.Count}");
+
+                // Calculate percentages
+                double totalHours = employeeSummaries.Sum(e => e.TotalHours);
+                foreach (var emp in employeeSummaries)
+                {
+                    emp.Percentage = (emp.TotalHours / totalHours) * 100;
+                }
+
+                // Display results
+                DisplayResults(employeeSummaries, totalHours);
+                
+                // Generate HTML report
+                await GenerateHTMLReport(employeeSummaries, totalHours);
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Error: {ex.Message}");
+            }
+
+            Console.WriteLine("\n🎯 Press any key to exit...");
+            Console.ReadKey();
+        }
+
+        private static double CalculateHours(DateTime start, DateTime end)
+        {
+            if (end < start)
+            {
+                // Swap if end time is before start time (data error)
+                var temp = start;
+                start = end;
+                end = temp;
+            }
+            return Math.Max(0, (end - start).TotalHours);
+        }
+
+        private static void DisplayResults(List<EmployeeSummary> employees, double totalHours)
+        {
+            Console.WriteLine();
+            Console.WriteLine("📊 SUMMARY STATISTICS");
+            Console.WriteLine("====================");
+            Console.WriteLine($"Total Employees: {employees.Count}");
+            Console.WriteLine($"Total Hours Tracked: {totalHours:F2}");
+            Console.WriteLine($"Average Hours per Employee: {employees.Average(e => e.TotalHours):F2}");
+            Console.WriteLine($"Employees under 100 hours: {employees.Count(e => e.TotalHours < 100)}");
+
+            Console.WriteLine();
+            Console.WriteLine("🏆 TOP 10 EMPLOYEES BY HOURS");
+            Console.WriteLine("============================");
+            Console.WriteLine("Rank | Status | Employee Name        | Hours  | Percentage | Visual");
+            Console.WriteLine("-----|--------|----------------------|--------|------------|--------");
+            
+            for (int i = 0; i < Math.Min(10, employees.Count); i++)
+            {
+                var emp = employees[i];
+                string status = emp.TotalHours < 100 ? "⚠️ LOW " : "✅ GOOD";
+                string bar = new string('█', Math.Max(1, (int)(emp.Percentage / 2)));
+                
+                Console.WriteLine($"{i+1,4} | {status} | {emp.Name,-20} | {emp.TotalHours,6:F1} | {emp.Percentage,9:F1}% | {bar}");
+            }
+
+            if (employees.Count > 10)
+            {
+                var remaining = employees.Count - 10;
+                var remainingHours = employees.Skip(10).Sum(e => e.TotalHours);
+                var remainingPercentage = employees.Skip(10).Sum(e => e.Percentage);
+                Console.WriteLine($"     |        | ... and {remaining} more       | {remainingHours,6:F1} | {remainingPercentage,9:F1}% |");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("📈 EMPLOYEES UNDER 100 HOURS (Need Attention)");
+            Console.WriteLine("=============================================");
+            
+            var lowHourEmployees = employees.Where(e => e.TotalHours < 100).ToList();
+            if (lowHourEmployees.Any())
+            {
+                foreach (var emp in lowHourEmployees)
+                {
+                    Console.WriteLine($"⚠️  {emp.Name}: {emp.TotalHours:F2} hours ({emp.Percentage:F1}%)");
+                }
+            }
+            else
+            {
+                Console.WriteLine("✅ All employees have 100+ hours!");
+            }
+        }
+
+        private static async Task GenerateHTMLReport(List<EmployeeSummary> employees, double totalHours)
+        {
+            Console.WriteLine();
+            Console.WriteLine("📄 Generating HTML report...");
+
+            var html = $@"<!DOCTYPE html>
+<html>
+<head>
+    <title>Employee Time Report</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }}
+        .container {{ max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }}
+        h1 {{ color: #333; text-align: center; margin-bottom: 10px; font-size: 2.5em; }}
+        .subtitle {{ text-align: center; color: #666; margin-bottom: 30px; }}
+        .summary {{ background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); padding: 20px; border-radius: 8px; margin-bottom: 20px; border-left: 5px solid #2196F3; }}
+        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 10px; }}
+        .stat {{ text-align: center; padding: 10px; background: rgba(255,255,255,0.7); border-radius: 6px; }}
+        .stat-number {{ font-size: 24px; font-weight: bold; color: #1976d2; }}
+        .stat-label {{ font-size: 12px; color: #666; text-transform: uppercase; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden; }}
+        th {{ background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%); color: white; padding: 15px 12px; text-align: left; font-weight: 600; }}
+        td {{ padding: 12px; border-bottom: 1px solid #e0e0e0; }}
+        tr:nth-child(even) {{ background-color: #f8f9fa; }}
+        tr:hover {{ background-color: #e8f5e8; }}
+        .low-hours {{ background-color: #ffebee !important; color: #c62828; font-weight: bold; }}
+        .low-hours:hover {{ background-color: #ffcdd2 !important; }}
+        .hours {{ text-align: right; font-weight: bold; font-family: 'Courier New', monospace; }}
+        .rank {{ text-align: center; font-weight: bold; color: #666; }}
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <h1>Employee Time Report</h1>
+        <div class='subtitle'>Comprehensive Work Hours Analysis</div>
+        
+        <div class='summary'>
+            <div class='stats'>
+                <div class='stat'>
+                    <div class='stat-number'>{employees.Count}</div>
+                    <div class='stat-label'>Total Employees</div>
+                </div>
+                <div class='stat'>
+                    <div class='stat-number'>{totalHours:F1}</div>
+                    <div class='stat-label'>Total Hours</div>
+                </div>
+                <div class='stat'>
+                    <div class='stat-number'>{employees.Average(e => e.TotalHours):F1}</div>
+                    <div class='stat-label'>Average Hours</div>
+                </div>
+                <div class='stat'>
+                    <div class='stat-number'>{employees.Count(e => e.TotalHours < 100)}</div>
+                    <div class='stat-label'>Under 100 Hours</div>
+                </div>
+            </div>
+        </div>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>Rank</th>
+                    <th>Employee Name</th>
+                    <th>Total Hours</th>
+                    <th>Percentage</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>";
+
+            int rank = 1;
+            foreach (var emp in employees)
+            {
+                string rowClass = emp.TotalHours < 100 ? "low-hours" : "";
+                string status = emp.TotalHours < 100 ? "⚠️ Below Target" : "✅ On Track";
+                
+                html += $@"
+                <tr class='{rowClass}'>
+                    <td class='rank'>{rank}</td>
+                    <td>{emp.Name}</td>
+                    <td class='hours'>{emp.TotalHours:F2}</td>
+                    <td class='hours'>{emp.Percentage:F1}%</td>
+                    <td>{status}</td>
+                </tr>";
+                rank++;
+            }
+
+            html += $@"
+            </tbody>
+        </table>
+        
+        <div style='margin-top: 30px; text-align: center; color: #999; font-size: 12px;'>
+            Report generated on {DateTime.Now:yyyy-MM-dd HH:mm:ss} | 
+            Employees highlighted in red have worked less than 100 hours
+        </div>
+    </div>
+</body>
+</html>";
+
+            await File.WriteAllTextAsync("employee_time_report.html", html);
+            Console.WriteLine("✅ HTML report saved: employee_time_report.html");
+        }
+    }
+}
